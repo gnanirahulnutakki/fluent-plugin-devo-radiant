@@ -1,0 +1,19 @@
+fluent-plugin-devo-radiant
+Copyright 2026 Radiant Logic, Inc.
+
+This product is a derivative work of DevoInc/fluent-plugin-devo version 1.2.0,
+licensed under the Apache License, Version 2.0. The upstream source is available
+at https://github.com/DevoInc/fluent-plugin-devo.
+
+The derivative retains the upstream copyright and license notices. Its material
+changes are:
+
+- masks the Devo token and client private-key configuration values;
+- uses Fluentd buffering and propagates send failures for chunk retry;
+- supports Fluentd multi-worker operation with a worker-aware synchronized cache;
+- warns when TLS verification is disabled and configures a minimum TLS version;
+- moves the vendored syslog TLS client into a fork-specific Ruby namespace; and
+- registers both the `devo_radiant` and compatibility `devo` output names.
+
+The bundled syslog TLS implementation also contains portions attributed in the
+LICENSE file to Acquia, t.e.morgan, JMC, Devo Inc., and syslog_ruby contributors.
