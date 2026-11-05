@@ -21,6 +21,7 @@ require 'date'
 
 require_relative 'facility'
 require_relative 'severity'
+require_relative 'utf8'
 
 module FluentPluginDevoRadiant
   module SyslogTls
@@ -60,9 +61,7 @@ module FluentPluginDevoRadiant
       end
 
       def severity=(value)
-        raise ArgumentError, "Invalid severity value: #{value.inspect}" unless SEVERITIES.key?(value)
-
-        @severity = value
+        @severity = Severity.normalize(value)
       end
 
       def pri
@@ -72,8 +71,8 @@ module FluentPluginDevoRadiant
       def assemble
         [
           "<#{pri}>#{timestamp.to_datetime.strftime('%b %d %H:%M:%S')}",
-          hostname,
-          app_name
+          Utf8.header_token(hostname),
+          Utf8.header_token(app_name)
         ].join(' ')
       end
 
@@ -121,7 +120,8 @@ module FluentPluginDevoRadiant
 
       def assemble
         output = [header.to_s]
-        output << msg if msg.length.positive?
+        message = Utf8.string(msg).sub(/[\r\n]+\z/, '')
+        output << message if message.length.positive?
         output.join(' ') + "\n"
       end
 

@@ -44,10 +44,15 @@ class DevoRadiantSyslogNamespaceAndLoggerTest < Test::Unit::TestCase
     assert_equal "<44>#{timestamp} hostname appname MESSAGE\n", output.string
   end
 
-  def test_protocol_rejects_unknown_severity_and_facility
+  def test_protocol_defaults_unknown_severity_and_rejects_unknown_facility
     header = SyslogTls::Header.new
 
-    assert_raise(ArgumentError) { header.severity = 'NOT_A_SEVERITY' }
+    header.severity = 'NOT_A_SEVERITY'
+    assert_equal 134, header.pri
+    ["bad\xFF".b, Float::NAN, Float::INFINITY, Complex(1, 2)].each do |value|
+      header.severity = value
+      assert_equal 134, header.pri
+    end
     assert_raise(ArgumentError) { header.facility = 'NOT_A_FACILITY' }
   end
 end

@@ -1,0 +1,49 @@
+# frozen_string_literal: true
+
+# Copyright 2016 Acquia, Inc.
+# Copyright 2016-2019 t.e.morgan.
+# Copyright 2021 JMC
+# Copyright 2026 Radiant Logic, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+module FluentPluginDevoRadiant
+  module SyslogTls
+    module Utf8
+      module_function
+
+      def string(value)
+        text = value.to_s
+        if text.encoding == Encoding::BINARY || text.encoding == Encoding::UTF_8
+          text.dup.force_encoding(Encoding::UTF_8).scrub("\uFFFD")
+        else
+          text.encode(Encoding::UTF_8, invalid: :replace, undef: :replace, replace: "\uFFFD")
+        end
+      end
+
+      def value(item)
+        case item
+        when String then string(item)
+        when Hash
+          item.each_with_object({}) { |(key, entry), result| result[value(key)] = value(entry) }
+        when Array then item.map { |entry| value(entry) }
+        else item
+        end
+      end
+
+      def header_token(value)
+        string(value).gsub(/[[:space:][:cntrl:]]/, '')
+      end
+    end
+  end
+end

@@ -201,10 +201,10 @@ class DevoRadiantOutputTest < Test::Unit::TestCase
     driver.instance.write(chunk)
 
     sent_entry = capturing_logger.entries.fetch(0)
-    assert_equal 'PANIC', sent_entry.severity
+    assert_equal 'EMERG', sent_entry.severity
     assert_equal 'record-host', sent_entry.header.hostname
-    assert_equal 'record-app', sent_entry.header.app_name
-    assert_equal "mapped message\n", sent_entry.message
+    assert_equal 'recordapp', sent_entry.header.app_name
+    assert_equal "mapped message", sent_entry.message
   end
 
   def test_buffered_format_and_write_preserve_tag_and_injected_record
@@ -247,8 +247,8 @@ class DevoRadiantOutputTest < Test::Unit::TestCase
     assert_equal 1, capturing_logger.entries.length
     sent_entry = capturing_logger.entries.first
     assert_equal 'INFO', sent_entry.severity
-    assert_equal Time.at(time.to_i), sent_entry.time
-    assert_equal({ 'message' => 'buffered record', 'source_tag' => tag }, JSON.parse(sent_entry.message))
+    assert_equal Time.at(time.sec, time.nsec, :nanosecond), sent_entry.time
+    assert_equal({ 'message' => 'buffered record', 'source_tag' => tag, '@timestamp' => '2024-08-30T06:40:00.123Z' }, JSON.parse(sent_entry.message))
   end
 
   def test_tls_verification_disablement_is_warned

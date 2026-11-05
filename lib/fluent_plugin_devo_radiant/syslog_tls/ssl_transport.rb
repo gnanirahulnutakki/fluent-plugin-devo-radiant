@@ -35,18 +35,21 @@ module FluentPluginDevoRadiant
 
       attr_accessor :socket
       attr_reader :host, :port, :idle_timeout, :ca_cert, :client_cert, :client_key,
-                  :verify_cert_name, :tls_min_version
+                  :verify_cert_name, :tls_min_version, :tls
       attr_writer :retries
 
       def initialize(host, port, idle_timeout: nil, ca_cert: 'system', client_cert: nil,
                      client_key: nil, verify_cert_name: true, tls_min_version: :'TLSv1_2',
-                     max_retries: 1)
+                     max_retries: 1, client_key_passphrase: nil, tls: true)
         @host = host
         @port = port
         @idle_timeout = idle_timeout
         @ca_cert = ca_cert
         @client_cert = client_cert
         @client_key = client_key
+        @client_key_passphrase = client_key_passphrase
+        @tls = tls
+        @closed = false
         @verify_cert_name = verify_cert_name
         @tls_min_version = tls_min_version.to_sym
         @retries = max_retries
@@ -59,62 +62,95 @@ module FluentPluginDevoRadiant
       end
 
       def connect
-        @socket = get_ssl_connection
-        begin
+        raise IOError, 'Transport is closed' if @closed
+
+        last_error = nil
+        resolved_addresses.each do |address_info|
+          candidate = nil
           begin
-            @socket.connect_nonblock
-          rescue Errno::EAGAIN, Errno::EWOULDBLOCK, IO::WaitReadable
-            select_with_timeout(@socket, :connect_read) && retry
-          rescue IO::WaitWritable
-            select_with_timeout(@socket, :connect_write) && retry
+            raise IOError, 'Transport is closed' if @closed
+
+            candidate = tls ? get_ssl_connection(address_info) : get_tcp_connection(address_info)
+            if tls
+              begin
+                candidate.connect_nonblock
+              rescue IO::WaitReadable
+                select_with_timeout(candidate, :connect_read)
+                retry
+              rescue IO::WaitWritable
+                select_with_timeout(candidate, :connect_write)
+                retry
+              end
+            end
+            raise IOError, 'Transport is closed' if @closed
+
+            @socket = candidate
+            @last_write = Time.now if idle_timeout
+            return
+          rescue StandardError => error
+            candidate.close if candidate && !candidate.closed?
+            raise if @closed
+
+            last_error = error
           end
-        rescue Errno::ETIMEDOUT
-          raise 'Socket timeout during connect'
         end
-        @last_write = Time.now if idle_timeout
+        raise(last_error || SocketError.new('No addresses resolved'))
       end
 
-      def get_tcp_connection
-        tcp = nil
-        family = Socket::Constants::AF_UNSPEC
-        socket_type = Socket::Constants::SOCK_STREAM
-        address_info = Socket.getaddrinfo(host, port, family, socket_type, nil, nil, false).first
-        _, resolved_port, _, address, family, socket_type = address_info
-
-        begin
-          socket_address = Socket.sockaddr_in(resolved_port, address)
-          tcp = Socket.new(family, socket_type, 0)
-          tcp.setsockopt(Socket::SOL_SOCKET, Socket::Constants::SO_REUSEADDR, false)
-          unless RbConfig::CONFIG['host_os'].match?(/mswin|mingw|cygwin/)
-            tcp.setsockopt(Socket::SOL_SOCKET, Socket::Constants::SO_REUSEPORT, false)
-          end
-          tcp.connect_nonblock(socket_address)
-        rescue Errno::EINPROGRESS
-          select_with_timeout(tcp, :connect_write)
-          begin
-            tcp.connect_nonblock(socket_address)
-          rescue Errno::EISCONN
-            # Connected.
-          rescue SystemCallError
-            tcp.close rescue nil
-            raise
-          end
-        rescue SystemCallError
-          tcp.close rescue nil
-          raise
-        end
-
-        tcp.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, true)
-        tcp
+      def resolved_addresses
+        Socket.getaddrinfo(host, port, Socket::AF_UNSPEC, Socket::SOCK_STREAM, nil, nil, false)
       end
 
-      def get_ssl_connection
-        tcp = get_tcp_connection
+      def get_tcp_connection(address_info = nil)
+        addresses = address_info ? [address_info] : resolved_addresses
+        last_error = nil
+        addresses.each do |address_info|
+          tcp = nil
+          begin
+            _, resolved_port, _, address, family, socket_type = address_info
+            socket_address = Socket.sockaddr_in(resolved_port, address)
+            tcp = Socket.new(family, socket_type, 0)
+            tcp.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, false)
+            unless RbConfig::CONFIG['host_os'].match?(/mswin|mingw|cygwin/)
+              tcp.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEPORT, false)
+            end
+            begin
+              tcp.connect_nonblock(socket_address)
+            rescue IO::WaitWritable
+              select_with_timeout(tcp, :connect_write)
+              error = tcp.getsockopt(Socket::SOL_SOCKET, Socket::SO_ERROR).int
+              raise SystemCallError.new('connect', error) unless error.zero?
+            end
+            tcp.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, true)
+            return tcp
+          rescue StandardError => error
+            tcp&.close
+            last_error = error
+          end
+        end
+        raise(last_error || SocketError.new('No addresses resolved'))
+      end
+
+      def get_ssl_connection(address_info = nil)
+        tcp = get_tcp_connection(address_info)
         context = build_ssl_context
         ssl_socket = OpenSSL::SSL::SSLSocket.new(tcp, context)
-        ssl_socket.hostname = host
         ssl_socket.sync_close = true
+        ssl_socket.hostname = host
         ssl_socket
+      rescue StandardError
+        ssl_socket&.close
+        tcp.close if tcp && !tcp.closed?
+        raise
+      end
+
+      def closed?
+        @closed || @socket.nil? || @socket.closed?
+      end
+
+      def close
+        @closed = true
+        @write_mutex.synchronize { close_socket }
       end
 
       def write(string)
@@ -127,6 +163,8 @@ module FluentPluginDevoRadiant
           sent = 0
           begin
             sent = @socket.write_nonblock(data)
+          rescue IO::WaitReadable
+            select_with_timeout(@socket, :write_read) && retry
           rescue OpenSSL::SSL::SSLError, Errno::EAGAIN, Errno::EWOULDBLOCK, IO::WaitWritable => error
             if error.is_a?(OpenSSL::SSL::SSLError) && error.message !~ /write would block/
               raise error
@@ -149,6 +187,8 @@ module FluentPluginDevoRadiant
                       [nil, [tcp], nil, CONNECT_TIMEOUT]
                     when :write
                       [nil, [tcp], nil, WRITE_TIMEOUT]
+                    when :write_read
+                      [[tcp], nil, nil, WRITE_TIMEOUT]
                     else
                       raise "Unknown select type #{type}"
                     end
@@ -180,14 +220,24 @@ module FluentPluginDevoRadiant
         when false, 'false'
           context.verify_hostname = false
           context.verify_mode = OpenSSL::SSL::VERIFY_NONE
-        when %r{/$}
-          context.ca_path = ca_cert
         when String
-          context.ca_file = ca_cert
+          if File.directory?(ca_cert)
+            context.ca_path = ca_cert
+          else
+            context.ca_file = ca_cert
+          end
         end
 
-        context.cert = OpenSSL::X509::Certificate.new(File.read(client_cert)) if client_cert
-        context.key = OpenSSL::PKey.read(File.read(client_key)) if client_key
+        if client_cert
+          certificates = File.read(client_cert).scan(/-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----/m)
+          raise OpenSSL::X509::CertificateError, 'Client certificate bundle is empty' if certificates.empty?
+
+          context.cert, *chain = certificates.map { |pem| OpenSSL::X509::Certificate.new(pem) }
+          context.extra_chain_cert = chain unless chain.empty?
+        end
+        if client_key
+          context.key = OpenSSL::PKey.read(File.read(client_key), @client_key_passphrase) { @client_key_passphrase }
+        end
         context
       end
 
@@ -195,26 +245,29 @@ module FluentPluginDevoRadiant
         context.min_version = TLS_MIN_VERSIONS.fetch(tls_min_version)
       end
 
-      def write_with_retries(string)
-        if idle_timeout
-          if (now = Time.now) > @last_write + idle_timeout
-            @socket.close rescue nil
-            connect
-          else
-            @last_write = now
-          end
-        end
+      def close_socket
+        @socket.close if @socket && !@socket.closed?
+      end
 
+      def write_with_retries(string)
+        raise IOError, 'Transport is closed' if @closed
+
+        retry_id = 0
         begin
-          retry_id ||= 0
-          do_write(string)
-        rescue StandardError => error
-          if (retry_id += 1) < @retries
-            @socket.close rescue nil
+          raise IOError, 'Transport is closed' if @closed
+
+          if @socket.nil? || @socket.closed? || (idle_timeout && Time.now > @last_write + idle_timeout)
+            close_socket
             connect
-            retry
           end
-          raise error
+          do_write(string)
+          @last_write = Time.now if idle_timeout
+        rescue StandardError
+          close_socket
+          retry_id += 1
+          retry if !@closed && retry_id < @retries
+
+          raise
         end
       end
     end
